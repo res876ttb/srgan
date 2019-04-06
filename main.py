@@ -13,6 +13,8 @@ from model import SRGAN_g, SRGAN_d, Vgg19_simple_api
 from utils import *
 from config import config, log_config
 
+import horovod.tensorflow as hvd
+
 ###====================== HYPER-PARAMETERS ===========================###
 ## Adam
 batch_size = config.TRAIN.batch_size
@@ -45,6 +47,7 @@ def train():
 
     ## If your machine have enough memory, please pre-load the whole train set.
     train_hr_imgs = tl.vis.read_images(train_hr_img_list, path=config.TRAIN.hr_img_path, n_threads=32)
+    # train_hr_imgs = tl.files.load_flickr25k_dataset(tag=None)
     # for im in train_hr_imgs:
     #     print(im.shape)
     # valid_lr_imgs = tl.vis.read_images(valid_lr_img_list, path=config.VALID.lr_img_path, n_threads=32)
@@ -98,17 +101,22 @@ def train():
     with tf.variable_scope('learning_rate'):
         lr_v = tf.Variable(lr_init, trainable=False)
     ## Pretrain
-    g_optim_init = tf.train.AdamOptimizer(lr_v, beta1=beta1).minimize(mse_loss, var_list=g_vars)
+    g_optim_init = hvd.DistributedOptimizer(tf.train.AdamOptimizer(lr_v, beta1=beta1)).minimize(mse_loss, var_list=g_vars)
     ## SRGAN
-    g_optim = tf.train.AdamOptimizer(lr_v, beta1=beta1).minimize(g_loss, var_list=g_vars)
-    d_optim = tf.train.AdamOptimizer(lr_v, beta1=beta1).minimize(d_loss, var_list=d_vars)
+    g_optim = hvd.DistributedOptimizer(tf.train.AdamOptimizer(lr_v, beta1=beta1)).minimize(g_loss, var_list=g_vars)
+    d_optim = hvd.DistributedOptimizer(tf.train.AdamOptimizer(lr_v, beta1=beta1)).minimize(d_loss, var_list=d_vars)
 
     ###========================== RESTORE MODEL =============================###
     sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True, log_device_placement=False))
     tl.layers.initialize_global_variables(sess)
-    if tl.files.load_and_assign_npz(sess=sess, name=checkpoint_dir + '/g_{}.npz'.format(tl.global_flag['mode']), network=net_g) is False:
+    if os.path.isfile(checkpoint_dir + '/g_{}.npz'.format(tl.global_flag['mode'])):
+        tl.files.load_and_assign_npz(sess=sess, name=checkpoint_dir + '/g_{}.npz'.format(tl.global_flag['mode']), network=net_g)
+    else:
         tl.files.load_and_assign_npz(sess=sess, name=checkpoint_dir + '/g_{}_init.npz'.format(tl.global_flag['mode']), network=net_g)
     tl.files.load_and_assign_npz(sess=sess, name=checkpoint_dir + '/d_{}.npz'.format(tl.global_flag['mode']), network=net_d)
+
+    ###============================= INIT GLOBAL VARIABLES ==================###
+    hvd.broadcast_global_variables(0)
 
     ###============================= LOAD VGG ===============================###
     vgg19_npy_path = "vgg19.npy"
@@ -135,10 +143,11 @@ def train():
     print('sample HR sub-image:', sample_imgs_384.shape, sample_imgs_384.min(), sample_imgs_384.max())
     sample_imgs_96 = tl.prepro.threading_data(sample_imgs_384, fn=downsample_fn)
     print('sample LR sub-image:', sample_imgs_96.shape, sample_imgs_96.min(), sample_imgs_96.max())
-    tl.vis.save_images(sample_imgs_96, [ni, ni], save_dir_ginit + '/_train_sample_96.png')
-    tl.vis.save_images(sample_imgs_384, [ni, ni], save_dir_ginit + '/_train_sample_384.png')
-    tl.vis.save_images(sample_imgs_96, [ni, ni], save_dir_gan + '/_train_sample_96.png')
-    tl.vis.save_images(sample_imgs_384, [ni, ni], save_dir_gan + '/_train_sample_384.png')
+    if hvd.rank() == -1:
+        tl.vis.save_images(sample_imgs_96, [ni, ni], save_dir_ginit + '/_train_sample_96.png')
+        tl.vis.save_images(sample_imgs_384, [ni, ni], save_dir_ginit + '/_train_sample_384.png')
+        tl.vis.save_images(sample_imgs_96, [ni, ni], save_dir_gan + '/_train_sample_96.png')
+        tl.vis.save_images(sample_imgs_384, [ni, ni], save_dir_gan + '/_train_sample_384.png')
 
     ###========================= initialize G ====================###
     ## fixed learning rate
@@ -159,9 +168,17 @@ def train():
         #     b_imgs_96 = tl.prepro.threading_data(b_imgs_384, fn=downsample_fn)
 
         ## If your machine have enough memory, please pre-load the whole train set.
-        for idx in range(0, len(train_hr_imgs), batch_size):
+        for idx in range(0, len(train_hr_imgs), batch_size * hvd.size()):
+            b_start = idx + batch_size * hvd.rank()
+            b_end = b_start + batch_size
+            if b_end > len(train_hr_imgs):
+              b_end = len(train_hr_imgs)
+              b_start = b_end - batch_size
+            if b_start > b_end:
+              b_end = len(train_hr_imgs)
+              b_start = b_end - batch_size
             step_time = time.time()
-            b_imgs_384 = tl.prepro.threading_data(train_hr_imgs[idx:idx + batch_size], fn=crop_sub_imgs_fn, is_random=True)
+            b_imgs_384 = tl.prepro.threading_data(train_hr_imgs[b_start:b_end], fn=crop_sub_imgs_fn, is_random=True)
             b_imgs_96 = tl.prepro.threading_data(b_imgs_384, fn=downsample_fn)
             ## update G
             errM, _ = sess.run([mse_loss, g_optim_init], {t_image: b_imgs_96, t_target_image: b_imgs_384})
@@ -172,13 +189,13 @@ def train():
         print(log)
 
         ## quick evaluation on train set
-        if (epoch != 0) and (epoch % 10 == 0):
+        if (epoch != 0) and (epoch % 10 == 0) and (hvd.rank() == 0):
             out = sess.run(net_g_test.outputs, {t_image: sample_imgs_96})  #; print('gen sub-image:', out.shape, out.min(), out.max())
             print("[*] save images")
             tl.vis.save_images(out, [ni, ni], save_dir_ginit + '/train_%d.png' % epoch)
 
         ## save model
-        if (epoch != 0) and (epoch % 10 == 0):
+        if (epoch != 0) and (epoch % 10 == 0) and (hvd.rank() == 0):
             tl.files.save_npz(net_g.all_params, name=checkpoint_dir + '/g_{}_init.npz'.format(tl.global_flag['mode']), sess=sess)
 
     ###========================= train GAN (SRGAN) =========================###
@@ -208,9 +225,17 @@ def train():
         #     b_imgs_96 = tl.prepro.threading_data(b_imgs_384, fn=downsample_fn)
 
         ## If your machine have enough memory, please pre-load the whole train set.
-        for idx in range(0, len(train_hr_imgs), batch_size):
+        for idx in range(0, len(train_hr_imgs), batch_size * hvd.size()):
+            b_start = idx + batch_size * hvd.rank()
+            b_end = b_start + batch_size
+            if b_end > len(train_hr_imgs):
+              b_end = len(train_hr_imgs)
+              b_start = b_end - batch_size
+            if b_start > b_end:
+              b_end = len(train_hr_imgs)
+              b_start = b_end - batch_size
             step_time = time.time()
-            b_imgs_384 = tl.prepro.threading_data(train_hr_imgs[idx:idx + batch_size], fn=crop_sub_imgs_fn, is_random=True)
+            b_imgs_384 = tl.prepro.threading_data(train_hr_imgs[b_start:b_end], fn=crop_sub_imgs_fn, is_random=True)
             b_imgs_96 = tl.prepro.threading_data(b_imgs_384, fn=downsample_fn)
             ## update D
             errD, _ = sess.run([d_loss, d_optim], {t_image: b_imgs_96, t_target_image: b_imgs_384})
@@ -233,7 +258,7 @@ def train():
             tl.vis.save_images(out, [ni, ni], save_dir_gan + '/train_%d.png' % epoch)
 
         ## save model
-        if (epoch != 0) and (epoch % 10 == 0):
+        if (epoch != 0) and (epoch % 10 == 0) and (hvd.rank() == 0):
             tl.files.save_npz(net_g.all_params, name=checkpoint_dir + '/g_{}.npz'.format(tl.global_flag['mode']), sess=sess)
             tl.files.save_npz(net_d.all_params, name=checkpoint_dir + '/d_{}.npz'.format(tl.global_flag['mode']), sess=sess)
 
@@ -307,6 +332,7 @@ if __name__ == '__main__':
     tl.global_flag['mode'] = args.mode
 
     if tl.global_flag['mode'] == 'srgan':
+        hvd.init()
         train()
     elif tl.global_flag['mode'] == 'evaluate':
         evaluate()
