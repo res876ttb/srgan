@@ -29,8 +29,29 @@ decay_every = config.TRAIN.decay_every
 
 ni = int(np.sqrt(batch_size))
 
+###====================== GLOBAL VARIABLE ===========================###
+cklog = {
+    'init': 0,
+    'train': 0
+}
+
+def load_cklog(checkpoint_dir, name):
+    global cklog
+    with open(checkpoint_dir + '/%s' % name, 'r') as f:
+      line = f.read().split(',')
+      cklog['init'] = int(line[0])
+      cklog['train'] = int(line[1])
+    return cklog
+
+def save_cklog(checkpoint_dir, name):
+    if hvd.rank() != 0:
+      return
+    global cklog
+    with open(checkpoint_dir + '/%s' % name, 'w') as f:
+      f.write('%d,%d' % (cklog['init'], cklog['train']))
 
 def train():
+    global cklog
     ## create folders to save result images and trained model
     save_dir_ginit = "samples/{}_ginit".format(tl.global_flag['mode'])
     save_dir_gan = "samples/{}_gan".format(tl.global_flag['mode'])
@@ -114,6 +135,10 @@ def train():
     else:
         tl.files.load_and_assign_npz(sess=sess, name=checkpoint_dir + '/g_{}_init.npz'.format(tl.global_flag['mode']), network=net_g)
     tl.files.load_and_assign_npz(sess=sess, name=checkpoint_dir + '/d_{}.npz'.format(tl.global_flag['mode']), network=net_d)
+    if os.path.isfile(checkpoint_dir + '/cklog'):
+        print(cklog)
+        cklog = load_cklog(checkpoint_dir, 'cklog')
+        print(cklog)
 
     ###============================= INIT GLOBAL VARIABLES ==================###
     hvd.broadcast_global_variables(0)
@@ -153,7 +178,7 @@ def train():
     ## fixed learning rate
     sess.run(tf.assign(lr_v, lr_init))
     print(" ** fixed learning rate: %f (for init G)" % lr_init)
-    for epoch in range(0, n_epoch_init + 1):
+    for epoch in range(cklog['init'], n_epoch_init + 1):
         epoch_time = time.time()
         total_mse_loss, n_iter = 0, 0
 
@@ -197,9 +222,11 @@ def train():
         ## save model
         if (epoch != 0) and (epoch % 10 == 0) and (hvd.rank() == 0):
             tl.files.save_npz(net_g.all_params, name=checkpoint_dir + '/g_{}_init.npz'.format(tl.global_flag['mode']), sess=sess)
+            cklog['init'] = epoch + 1
+            save_cklog(checkpoint_dir, 'cklog')
 
     ###========================= train GAN (SRGAN) =========================###
-    for epoch in range(0, n_epoch + 1):
+    for epoch in range(cklog['train'], n_epoch + 1):
         ## update learning rate
         if epoch != 0 and (epoch % decay_every == 0):
             new_lr_decay = lr_decay**(epoch // decay_every)
@@ -261,6 +288,8 @@ def train():
         if (epoch != 0) and (epoch % 10 == 0) and (hvd.rank() == 0):
             tl.files.save_npz(net_g.all_params, name=checkpoint_dir + '/g_{}.npz'.format(tl.global_flag['mode']), sess=sess)
             tl.files.save_npz(net_d.all_params, name=checkpoint_dir + '/d_{}.npz'.format(tl.global_flag['mode']), sess=sess)
+            cklog['train'] = epoch + 1
+            save_cklog(checkpoint_dir, 'cklog')
 
 
 def evaluate():
