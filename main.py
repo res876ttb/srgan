@@ -34,6 +34,12 @@ cklog = {
     'init': 0,
     'train': 0
 }
+cd = 3600
+nckt = time.time()
+
+def check_duration():
+  global nckt
+  return time.time() >= nckt
 
 def load_cklog(checkpoint_dir, name):
     global cklog
@@ -51,7 +57,7 @@ def save_cklog(checkpoint_dir, name):
       f.write('%d,%d' % (cklog['init'], cklog['train']))
 
 def train():
-    global cklog
+    global cklog, nckt
     ## create folders to save result images and trained model
     save_dir_ginit = "samples/{}_ginit".format(tl.global_flag['mode'])
     save_dir_gan = "samples/{}_gan".format(tl.global_flag['mode'])
@@ -168,11 +174,14 @@ def train():
     print('sample HR sub-image:', sample_imgs_384.shape, sample_imgs_384.min(), sample_imgs_384.max())
     sample_imgs_96 = tl.prepro.threading_data(sample_imgs_384, fn=downsample_fn)
     print('sample LR sub-image:', sample_imgs_96.shape, sample_imgs_96.min(), sample_imgs_96.max())
-    if hvd.rank() == -1:
-        tl.vis.save_images(sample_imgs_96, [ni, ni], save_dir_ginit + '/_train_sample_96.png')
-        tl.vis.save_images(sample_imgs_384, [ni, ni], save_dir_ginit + '/_train_sample_384.png')
-        tl.vis.save_images(sample_imgs_96, [ni, ni], save_dir_gan + '/_train_sample_96.png')
-        tl.vis.save_images(sample_imgs_384, [ni, ni], save_dir_gan + '/_train_sample_384.png')
+    # tl.vis.save_images(sample_imgs_96, [ni, ni], save_dir_ginit + '/_train_sample_96.png')
+    # tl.vis.save_images(sample_imgs_384, [ni, ni], save_dir_ginit + '/_train_sample_384.png')
+    # tl.vis.save_images(sample_imgs_96, [ni, ni], save_dir_gan + '/_train_sample_96.png')
+    # tl.vis.save_images(sample_imgs_384, [ni, ni], save_dir_gan + '/_train_sample_384.png')
+
+
+    ###========================= Init ckpt == ====================###
+    nckt = time.time() + cd
 
     ###========================= initialize G ====================###
     ## fixed learning rate
@@ -210,6 +219,17 @@ def train():
             print("Epoch [%2d/%2d] %4d time: %4.4fs, mse: %.8f " % (epoch, n_epoch_init, n_iter, time.time() - step_time, errM))
             total_mse_loss += errM
             n_iter += 1
+
+            ## Save model according to duration. Minimal unit: epoch
+            if (hvd.rank() == 0) and check_duration():
+              print('Saving checkpoint for init...')
+              nckt += cd
+              tl.files.save_npz(net_g.all_params, name=checkpoint_dir + '/g_{}_init.npz'.format(tl.global_flag['mode']), sess=sess)
+              cklog['init'] = epoch
+              save_cklog(checkpoint_dir, 'cklog')
+              print('Saving checkpoint for init... DONE')
+              
+
         log = "[*] Epoch: [%2d/%2d] time: %4.4fs, mse: %.8f" % (epoch, n_epoch_init, time.time() - epoch_time, total_mse_loss / n_iter)
         print(log)
 
@@ -220,10 +240,10 @@ def train():
             tl.vis.save_images(out, [ni, ni], save_dir_ginit + '/train_%d.png' % epoch)
 
         ## save model
-        if (epoch != 0) and (epoch % 10 == 0) and (hvd.rank() == 0):
-            tl.files.save_npz(net_g.all_params, name=checkpoint_dir + '/g_{}_init.npz'.format(tl.global_flag['mode']), sess=sess)
-            cklog['init'] = epoch + 1
-            save_cklog(checkpoint_dir, 'cklog')
+        # if (epoch != 0) and (epoch % 10 == 0) and (hvd.rank() == 0):
+            # tl.files.save_npz(net_g.all_params, name=checkpoint_dir + '/g_{}_init.npz'.format(tl.global_flag['mode']), sess=sess)
+            # cklog['init'] = epoch + 1
+            # save_cklog(checkpoint_dir, 'cklog')
 
     ###========================= train GAN (SRGAN) =========================###
     for epoch in range(cklog['train'], n_epoch + 1):
@@ -274,6 +294,15 @@ def train():
             total_g_loss += errG
             n_iter += 1
 
+            if hvd.rank() == 0 and check_duration():
+              print('Saving checkpoint for training...')
+              nckt += cd
+              tl.files.save_npz(net_g.all_params, name=checkpoint_dir + '/g_{}.npz'.format(tl.global_flag['mode']), sess=sess)
+              tl.files.save_npz(net_d.all_params, name=checkpoint_dir + '/d_{}.npz'.format(tl.global_flag['mode']), sess=sess)
+              cklog['train'] = epoch
+              save_cklog(checkpoint_dir, 'cklog')
+              print('Saving checkpoint for training... DONE')
+
         log = "[*] Epoch: [%2d/%2d] time: %4.4fs, d_loss: %.8f g_loss: %.8f" % (epoch, n_epoch, time.time() - epoch_time, total_d_loss / n_iter,
                                                                                 total_g_loss / n_iter)
         print(log)
@@ -285,11 +314,11 @@ def train():
             tl.vis.save_images(out, [ni, ni], save_dir_gan + '/train_%d.png' % epoch)
 
         ## save model
-        if (epoch != 0) and (epoch % 10 == 0) and (hvd.rank() == 0):
-            tl.files.save_npz(net_g.all_params, name=checkpoint_dir + '/g_{}.npz'.format(tl.global_flag['mode']), sess=sess)
-            tl.files.save_npz(net_d.all_params, name=checkpoint_dir + '/d_{}.npz'.format(tl.global_flag['mode']), sess=sess)
-            cklog['train'] = epoch + 1
-            save_cklog(checkpoint_dir, 'cklog')
+        # if (epoch != 0) and (epoch % 10 == 0) and (hvd.rank() == 0):
+            # tl.files.save_npz(net_g.all_params, name=checkpoint_dir + '/g_{}.npz'.format(tl.global_flag['mode']), sess=sess)
+            # tl.files.save_npz(net_d.all_params, name=checkpoint_dir + '/d_{}.npz'.format(tl.global_flag['mode']), sess=sess)
+            # cklog['train'] = epoch + 1
+            # save_cklog(checkpoint_dir, 'cklog')
 
 
 def evaluate():
@@ -355,8 +384,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--mode', type=str, default='srgan', help='srgan, evaluate')
+    parser.add_argument('--cd', type=int, default=3600, help='Checkpoint duration. Unit: seconds. Default: 3600.')
 
     args = parser.parse_args()
+
+    cd = args.cd
 
     tl.global_flag['mode'] = args.mode
 
